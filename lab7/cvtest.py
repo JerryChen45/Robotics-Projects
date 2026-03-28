@@ -64,7 +64,6 @@ def main():
     arrow_mask = cv2.inRange(hsv, lower_blue, upper_blue)
 
     h, w = arrow_mask.shape
-    print(h,w)
     left_half = arrow_mask[:, :w//2]
     right_half = arrow_mask[:, w//2:]
     left_rows = np.any(left_half > 0, axis=1)

@@ -55,7 +55,7 @@ def calc_centroids(segmented_image):
     return red_balls
     
 def main():
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(1)
 
     if not cap.isOpened():
         exit()
