@@ -5,7 +5,7 @@ import termios
 import select
 import pigpio
 
-SERVO_PIN = 17
+SERVO_PIN = 14
 MIN_PW = 500
 MAX_PW = 2500
 STEP = 50

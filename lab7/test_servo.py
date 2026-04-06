@@ -5,11 +5,11 @@ import termios
 import select
 import pigpio
 
-SERVO_PIN = 17
+SERVO_PIN = 14
 MIN_PW = 500
 MAX_PW = 2500
-STEP = 150
-TICK = 0.05
+STEP = 50
+TICK = 1
 
 def clip(x, lo, hi):
     return lo if x < lo else hi if x > hi else x

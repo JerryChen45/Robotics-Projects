@@ -5,8 +5,10 @@ import termios
 import select
 from motorgo import Plink, ControlMode
 
-LEFT_CHS = [1, 2]
-RIGHT_CHS = [3, 4]
+LEFT_CHS   = [1, 2]
+RIGHT_CHS  = [3, 4]
+LEFT_DIRS  = [-1, 1]
+RIGHT_DIRS = [1, 1]  # flip whichever motor is reversed: try [1, -1] if still wrong
 POWER = 1
 TICK = 0.05
 
@@ -22,17 +24,17 @@ def main():
         p.connect()
         print("Connected.")
 
-        left = [getattr(p, f"channel{ch}") for ch in LEFT_CHS]
+        left  = [getattr(p, f"channel{ch}") for ch in LEFT_CHS]
         right = [getattr(p, f"channel{ch}") for ch in RIGHT_CHS]
 
         for m in left + right:
             m.control_mode = ControlMode.POWER
 
         def set_motors(l_pwr, r_pwr):
-            for m in left:
-                m.power_command = l_pwr
-            for m in right:
-                m.power_command = r_pwr
+            for m, d in zip(left, LEFT_DIRS):
+                m.power_command = l_pwr * d
+            for m, d in zip(right, RIGHT_DIRS):
+                m.power_command = r_pwr * d
 
         print("Controls (hold to move, release to stop):")
         print("  W = forward")
@@ -53,13 +55,13 @@ def main():
             if last_key == 'q' or last_key == '\x03':
                 break
             elif last_key == 'w':
-                set_motors(POWER, -POWER)
-            elif last_key == 's':
-                set_motors(-POWER, POWER)
-            elif last_key == 'a':
-                set_motors(POWER, POWER)
-            elif last_key == 'd':
                 set_motors(-POWER, -POWER)
+            elif last_key == 's':
+                set_motors(POWER, POWER)
+            elif last_key == 'a':
+                set_motors(POWER, -POWER)
+            elif last_key == 'd':
+                set_motors(-POWER, POWER)
             else:
                 set_motors(0.0, 0.0)
 
