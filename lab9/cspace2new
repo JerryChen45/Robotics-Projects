@@ -1,0 +1,649 @@
+"""
+cspace2.py — C-space planning module for Lab 9
+Imported by main.py.  No motor code here.
+
+Speed: C-space is built with vectorised numpy (all (θ1,θ2) at once),
+       typically ~0.3 s instead of 2+ s for the loop version.
+
+C-space cell values
+  0 = free
+  1 = hard collision  (arm link hits raw obstacle)
+  2 = obstacle pad    (arm link within PAD of obstacle)
+  3 = wall pad        (arm link within WALL_PAD of arena edge)
+"""
+
+import math
+import heapq
+import time
+import numpy as np
+import matplotlib
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from matplotlib.gridspec import GridSpec
+from matplotlib.lines import Line2D
+
+# ── Arm geometry ──────────────────────────────────────────────────────────────
+L1 = 4.0    # inches, link 1
+L2 = 4.5    # inches, link 2
+
+# ── C-space grid ──────────────────────────────────────────────────────────────
+RES    = 2
+T1_MIN, T1_MAX = 0,    180
+T2_MIN, T2_MAX = -180, 180
+T1N = int((T1_MAX - T1_MIN) / RES) + 1   # 91
+T2N = int((T2_MAX - T2_MIN) / RES) + 1   # 181
+
+# ── Obstacles — RAW, unpadded [x_min, x_max, y_min, y_max] (inches) ──────────
+OBSTACLES = [
+    [-4.0, -2.0, 4.0, 6.0],
+    [ 1.0,  3.0, 5.0, 7.0],
+]
+
+# ── Padding ───────────────────────────────────────────────────────────────────
+PAD      = 0.2    # obstacle inflation (inches)
+WALL_PAD = 0.1    # arena edge buffer  (inches)
+ARENA    = (-7.0, 7.0, 0.0, 8.0)   # x_min, x_max, y_min, y_max
+
+# ── Waypoints (inches) ────────────────────────────────────────────────────────
+START = (6.25, 0.0)
+A     = (3.0,  2.0)
+B     = (0.0,  4.0)
+C     = (-3.0, 2.0)
+
+WAYPOINTS      = [START, A, B, C]
+WAYPOINT_NAMES = ["Start", "A", "B", "C"]
+WP_COLORS      = ["#3266ad", "#1D9E75", "#EF9F27", "#D4537E"]
+
+# ── Execution timing ──────────────────────────────────────────────────────────
+HOLD_SEC      = 3.0
+STEP_SLEEP    = 0.05
+POS_TOLERANCE = 3.0    # degrees
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Kinematics
+# ══════════════════════════════════════════════════════════════════════════════
+
+def fk(t1d, t2d):
+    """Forward kinematics → (jx, jy, ex, ey) in inches."""
+    t1, t2 = math.radians(t1d), math.radians(t2d)
+    jx = L1 * math.cos(t1);  jy = L1 * math.sin(t1)
+    ex = jx + L2 * math.cos(t1 + t2)
+    ey = jy + L2 * math.sin(t1 + t2)
+    return jx, jy, ex, ey
+
+
+def ik(x, y):
+    """
+    Inverse kinematics → list of (t1_deg, t2_deg) solutions.
+    Returns up to 2 solutions (elbow-up / elbow-down).
+    Returns [] if point is unreachable.
+    """
+    r2  = x*x + y*y
+    c2  = (r2 - L1**2 - L2**2) / (2 * L1 * L2)
+    if abs(c2) > 1.0:
+        return []
+    sols = []
+    for sign in [1, -1]:
+        t2r = math.atan2(sign * math.sqrt(max(0, 1 - c2**2)), c2)
+        t1r = math.atan2(y, x) - math.atan2(L2 * math.sin(t2r),
+                                              L1 + L2 * math.cos(t2r))
+        t1d = math.degrees(t1r) % 360
+        if 0 <= t1d <= 180:
+            sols.append((t1d, math.degrees(t2r)))
+    return sols
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# C-space — vectorised build
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_cspace(obs_raw=None, pad=PAD, wall_pad=WALL_PAD, arena=ARENA):
+    """
+    Build the C-space grid using vectorised numpy — typically ~0.3 s.
+
+    Returns uint8 array shape (T1N, T2N):
+      0 = free
+      1 = hard obstacle collision
+      2 = obstacle pad zone
+      3 = wall pad zone
+    """
+    if obs_raw is None:
+        obs_raw = OBSTACLES
+
+    print("Building C-space...", end=" ", flush=True)
+    t0 = time.time()
+
+    N = 30   # samples per link segment for collision check
+
+    # All (θ1, θ2) angle pairs as 2D grids (T1N, T2N)
+    t1_rad = np.radians(np.arange(T1N) * RES + T1_MIN)
+    t2_rad = np.radians(np.arange(T2N) * RES + T2_MIN)
+    T1G, T2G = np.meshgrid(t1_rad, t2_rad, indexing='ij')
+
+    # Joint and EE positions for every config
+    JX = L1 * np.cos(T1G)
+    JY = L1 * np.sin(T1G)
+    EX = JX + L2 * np.cos(T1G + T2G)
+    EY = JY + L2 * np.sin(T1G + T2G)
+
+    # Sample points along each link: shape (T1N, T2N, N)
+    ts = np.linspace(0.0, 1.0, N)
+    L1X = JX[..., None] * ts          # link 1: (0,0) → (JX, JY)
+    L1Y = JY[..., None] * ts
+    L2X = JX[..., None] + (EX - JX)[..., None] * ts   # link 2
+    L2Y = JY[..., None] + (EY - JY)[..., None] * ts
+
+    # All arm sample points: (T1N, T2N, 2N)
+    AX = np.concatenate([L1X, L2X], axis=-1)
+    AY = np.concatenate([L1Y, L2Y], axis=-1)
+
+    # For wall-pad only: exclude t=0 (the fixed base at origin).
+    # The mounting point is always at (0,0) which is on the arena floor,
+    # so including it would flag every single configuration.
+    ts_w  = ts[1:]
+    L1X_w = JX[..., None] * ts_w
+    L1Y_w = JY[..., None] * ts_w
+    L2X_w = JX[..., None] + (EX - JX)[..., None] * ts_w
+    L2Y_w = JY[..., None] + (EY - JY)[..., None] * ts_w
+    AX_w  = np.concatenate([L1X_w, L2X_w], axis=-1)
+    AY_w  = np.concatenate([L1Y_w, L2Y_w], axis=-1)
+
+    def hits(lx, ly, x1, x2, y1, y2):
+        """True for cells where any sample point lies inside the rectangle."""
+        return np.any(
+            (lx >= x1) & (lx <= x2) & (ly >= y1) & (ly <= y2),
+            axis=-1
+        )
+
+    cm = np.zeros((T1N, T2N), dtype=np.uint8)
+
+    # 1. Hard obstacle collision
+    for x1, x2, y1, y2 in obs_raw:
+        cm[hits(AX, AY, x1, x2, y1, y2)] = 1
+
+    # 2. Obstacle pad zone (only where not already 1)
+    for x1, x2, y1, y2 in obs_raw:
+        zone = hits(AX, AY, x1 - pad, x2 + pad, y1 - pad, y2 + pad)
+        cm[(zone) & (cm == 0)] = 2
+
+    # 3. Wall pad zone — uses AX_w/AY_w (moving arm, base excluded)
+    if wall_pad > 0:
+        ax1, ax2, ay1, ay2 = arena
+        near_wall = np.any(
+            (AX_w < ax1 + wall_pad) | (AX_w > ax2 - wall_pad) |
+            (AY_w < ay1 + wall_pad) | (AY_w > ay2 - wall_pad),
+            axis=-1
+        )
+        cm[(near_wall) & (cm == 0)] = 3
+
+    print(f"done ({time.time() - t0:.2f}s).  "
+          f"free={np.sum(cm==0)}  obs={np.sum(cm==1)}  "
+          f"obs-pad={np.sum(cm==2)}  wall-pad={np.sum(cm==3)}")
+    return cm
+
+
+def cell_of(t1d, t2d):
+    i = max(0, min(T1N - 1, round((t1d - T1_MIN) / RES)))
+    j = round((t2d - T2_MIN) / RES) % T2N
+    return i, j
+
+
+def angles_of(i, j):
+    return T1_MIN + i * RES, T2_MIN + j * RES
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A* path search
+# ══════════════════════════════════════════════════════════════════════════════
+
+_DIRS = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
+
+# Penalty costs — A* avoids these cells but doesn't hard-block them
+_COST_OBS_PAD  = 40.0
+_COST_WALL_PAD = 20.0
+
+
+def _h(i, j, gi, gj):
+    di = abs(i - gi) * RES
+    dj = min(abs(j - gj), T2N - abs(j - gj)) * RES
+    return math.hypot(di, dj)
+
+
+def astar(si, sj, gi, gj, cmap):
+    """
+    A* on the C-space grid.
+    Heap entry: (f, g, i, j)  — g stored separately so stale check is g vs dist.
+    Returns list of (i,j) cells or None if unreachable.
+    """
+    INF  = float('inf')
+    dist = np.full((T1N, T2N), INF, np.float32)
+    prev = np.full((T1N, T2N, 2), -1, np.int16)
+    dist[si, sj] = 0.0
+    heap = [(_h(si, sj, gi, gj), 0.0, si, sj)]
+
+    while heap:
+        f, g, ci, cj = heapq.heappop(heap)
+
+        if ci == gi and cj == gj:
+            path = []
+            ni, nj = ci, cj
+            while ni >= 0:
+                path.append((ni, nj))
+                pi, pj = prev[ni, nj]
+                ni, nj = int(pi), int(pj)
+            return path[::-1]
+
+        if g > dist[ci, cj] + 1e-4:
+            continue   # stale heap entry
+
+        for di, dj in _DIRS:
+            ni = ci + di
+            nj = (cj + dj + T2N) % T2N   # θ2 wrap-around
+            if ni < 0 or ni >= T1N:
+                continue
+            v = cmap[ni, nj]
+            if v == 1:
+                continue   # hard collision — never enter
+            step = math.hypot(di * RES, dj * RES)
+            if v == 2: step += _COST_OBS_PAD
+            if v == 3: step += _COST_WALL_PAD
+            nd = dist[ci, cj] + step
+            if nd < dist[ni, nj]:
+                dist[ni, nj] = nd
+                prev[ni, nj] = (ci, cj)
+                heapq.heappush(heap, (nd + _h(ni, nj, gi, gj), nd, ni, nj))
+
+    return None
+
+
+def plan_segment(from_xy, to_xy, cmap, label=""):
+    """
+    Plan a collision-free path from from_xy to to_xy.
+    Tries all IK solution combinations and returns the shortest A* path
+    as a list of (t1_deg, t2_deg) angle pairs.
+    """
+    from_sols = [s for s in ik(*from_xy) if cmap[cell_of(*s)] != 1]
+    to_sols   = [s for s in ik(*to_xy)   if cmap[cell_of(*s)] != 1]
+    if not from_sols:
+        raise ValueError(f"No collision-free IK for {label} start {from_xy}")
+    if not to_sols:
+        raise ValueError(f"No collision-free IK for {label} goal {to_xy}")
+
+    best, best_len = None, float('inf')
+    for fs in from_sols:
+        si, sj = cell_of(*fs)
+        for ts in to_sols:
+            gi, gj = cell_of(*ts)
+            p = astar(si, sj, gi, gj, cmap)
+            if p and len(p) < best_len:
+                best_len = len(p)
+                best = p
+
+    if best is None:
+        raise RuntimeError(f"A* found no path to {label}")
+    return [angles_of(i, j) for i, j in best]
+
+
+def downsample(path, delta=4.0):
+    """Keep only waypoints where at least one joint changes by delta degrees."""
+    if len(path) <= 2:
+        return path
+    out = [path[0]]
+    for pt in path[1:-1]:
+        d1 = abs(pt[0] - out[-1][0])
+        d2 = min(abs(pt[1] - out[-1][1]), 360 - abs(pt[1] - out[-1][1]))
+        if d1 >= delta or d2 >= delta:
+            out.append(pt)
+    out.append(path[-1])
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Figure 1 — Pre-run: C-space + workspace + arm configs at A, B, C
+# ══════════════════════════════════════════════════════════════════════════════
+
+def show_plan(cmap, full_path, named_configs, path_A, path_B, path_C):
+    """
+    Two-row figure:
+      Row 1: C-space with planned path  |  Workspace trajectory
+      Row 2: Arm pose at Start, A, B, C (static snapshots)
+    """
+    fig = plt.figure("Pre-run: Planned trajectory", figsize=(14, 9))
+    fig.patch.set_facecolor("#1a1a1a")
+    gs = GridSpec(2, 4, figure=fig,
+                  hspace=0.35, wspace=0.25,
+                  height_ratios=[1.4, 1])
+
+    ax_cs = fig.add_subplot(gs[0, :2])
+    ax_ws = fig.add_subplot(gs[0, 2:])
+    pose_axes = [fig.add_subplot(gs[1, k]) for k in range(4)]
+
+    for ax in [ax_cs, ax_ws] + pose_axes:
+        ax.set_facecolor("#111")
+        for sp in ax.spines.values():
+            sp.set_color("#444")
+        ax.tick_params(colors="#888", labelsize=7)
+
+    # ── C-space ───────────────────────────────────────────────────────────────
+    img = np.zeros((*cmap.T.shape, 4))
+    img[cmap.T == 0] = [0.06, 0.18, 0.06, 1.0]
+    img[cmap.T == 1] = [0.85, 0.28, 0.28, 1.0]
+    img[cmap.T == 2] = [0.85, 0.45, 0.25, 0.5]
+    img[cmap.T == 3] = [0.32, 0.29, 0.72, 0.4]   # wall pad = purple tint
+    ax_cs.imshow(img, origin="lower",
+                 extent=[T1_MIN, T1_MAX, T2_MIN, T2_MAX],
+                 aspect="auto", interpolation="nearest")
+
+    t1s = [t1 for t1, _ in full_path]
+    t2s = [t2 for _, t2 in full_path]
+    ax_cs.plot(t1s, t2s, color="white", lw=1.2, alpha=0.85, zorder=3)
+
+    for name, color, t1, t2 in named_configs:
+        ax_cs.plot(t1, t2, "o", color=color, ms=8, zorder=5,
+                   markeredgecolor="white", markeredgewidth=0.8)
+        ax_cs.text(t1 + 2, t2 + 4, name, color=color, fontsize=8)
+
+    ax_cs.set_xlabel("θ₁ (deg)", color="#888", fontsize=9)
+    ax_cs.set_ylabel("θ₂ (deg)", color="#888", fontsize=9)
+    ax_cs.set_title("C-space — white = planned path", color="#ccc", fontsize=10)
+    ax_cs.grid(color="#333", lw=0.4)
+
+    cleg = [
+        Line2D([0],[0], color="w", lw=2,   label="Path"),
+        patches.Patch(fc=[0.85,0.28,0.28], label="Obstacle"),
+        patches.Patch(fc=[0.85,0.45,0.25,0.6], label="Obs pad"),
+        patches.Patch(fc=[0.32,0.29,0.72,0.5], label="Wall pad"),
+    ]
+    ax_cs.legend(handles=cleg, loc="lower right",
+                 facecolor="#1a1a1a", edgecolor="#444",
+                 labelcolor="#ccc", fontsize=7)
+
+    # ── Workspace ─────────────────────────────────────────────────────────────
+    ax_ws.set_xlim(-8, 8);  ax_ws.set_ylim(-1, 9)
+    ax_ws.set_aspect("equal");  ax_ws.grid(color="#333", lw=0.4)
+    ax_ws.axhline(0, color="#555", lw=0.6);  ax_ws.axvline(0, color="#555", lw=0.6)
+    ax_ws.set_xlabel("x (in)", color="#888", fontsize=9)
+    ax_ws.set_ylabel("y (in)", color="#888", fontsize=9)
+    ax_ws.set_title("Workspace trajectory", color="#ccc", fontsize=10)
+
+    ax1, ax2, ay1, ay2 = ARENA
+    ax_ws.add_patch(patches.Rectangle((ax1, ay1), ax2-ax1, ay2-ay1,
+                    fc="none", ec="#666", lw=1.5, zorder=1))
+    if WALL_PAD > 0:
+        ax_ws.add_patch(patches.Rectangle(
+            (ax1+WALL_PAD, ay1+WALL_PAD),
+            ax2-ax1-2*WALL_PAD, ay2-ay1-2*WALL_PAD,
+            fc="none", ec="#534AB7", lw=0.8, ls="--", alpha=0.6))
+
+    for x1, x2, y1, y2 in OBSTACLES:
+        ax_ws.add_patch(patches.Rectangle((x1, y1), x2-x1, y2-y1,
+                        fc="#e24b4a", alpha=0.55, ec="#e24b4a", lw=0.8))
+        ax_ws.add_patch(patches.Rectangle((x1-PAD, y1-PAD),
+                        x2-x1+2*PAD, y2-y1+2*PAD,
+                        fc="none", ec="#e8593c", lw=0.6, ls="--", alpha=0.5))
+
+    seg_colors = [WP_COLORS[1], WP_COLORS[2], WP_COLORS[3]]
+    seg_ends   = [cell_of(*wp) for wp in WAYPOINTS[1:]]
+    seg_idx, ptr = 0, 0
+    sx, sy = [], []
+    while ptr < len(full_path) and seg_idx < 3:
+        t1, t2 = full_path[ptr]
+        _, _, ex, ey = fk(t1, t2)
+        sx.append(ex);  sy.append(ey)
+        ci, cj = cell_of(t1, t2)
+        ptr += 1
+        if (ci, cj) == seg_ends[seg_idx]:
+            ax_ws.plot(sx, sy, color=seg_colors[seg_idx], lw=1.5, alpha=0.8)
+            sx, sy = [ex], [ey]
+            seg_idx += 1
+
+    for i, (wx, wy) in enumerate(WAYPOINTS):
+        ax_ws.plot(wx, wy, "o", color=WP_COLORS[i], ms=9,
+                   markeredgecolor="white", markeredgewidth=0.8, zorder=6)
+        ax_ws.text(wx + 0.15, wy + 0.15, WAYPOINT_NAMES[i],
+                   color=WP_COLORS[i], fontsize=9, fontweight="bold")
+
+    wleg = [
+        Line2D([0],[0], marker="s", color="w",
+               markerfacecolor="#e24b4a", ms=8, label="Obstacle"),
+        Line2D([0],[0], color=WP_COLORS[1], lw=2, label="S→A"),
+        Line2D([0],[0], color=WP_COLORS[2], lw=2, label="A→B"),
+        Line2D([0],[0], color=WP_COLORS[3], lw=2, label="B→C"),
+    ]
+    ax_ws.legend(handles=wleg, loc="lower right",
+                 facecolor="#1a1a1a", edgecolor="#444",
+                 labelcolor="#ccc", fontsize=8)
+
+    # ── Bottom row: arm pose at Start / A / B / C ─────────────────────────────
+    snap_paths = [path_A, path_A, path_B, path_C]
+    snap_end   = [0, -1, -1, -1]   # 0 = first point (start), -1 = last
+
+    for k, (ax, wp_name, wp_color) in enumerate(
+            zip(pose_axes, WAYPOINT_NAMES, WP_COLORS)):
+        t1, t2 = snap_paths[k][snap_end[k]]
+        jx, jy, ex, ey = fk(t1, t2)
+
+        ax.set_xlim(-9, 9);  ax.set_ylim(-1, 9)
+        ax.set_aspect("equal");  ax.grid(color="#222", lw=0.3)
+        ax.axhline(0, color="#444", lw=0.5)
+        ax.axvline(0, color="#444", lw=0.5)
+
+        # obstacles
+        for x1, x2, y1, y2 in OBSTACLES:
+            ax.add_patch(patches.Rectangle((x1, y1), x2-x1, y2-y1,
+                         fc="#e24b4a", alpha=0.4, ec="#e24b4a", lw=0.5))
+
+        # arm links
+        ax.plot([0, jx], [0, jy], color="#3266ad", lw=3,
+                solid_capstyle="round")
+        ax.plot([jx, ex], [jy, ey], color="#1D9E75", lw=3,
+                solid_capstyle="round")
+        ax.plot(0,  0,  "o", color="#3266ad", ms=5)
+        ax.plot(jx, jy, "o", color="#888",   ms=4)
+        ax.plot(ex, ey, "o", color="#f4a023", ms=6, zorder=8)
+
+        # EE target marker
+        wx, wy = WAYPOINTS[k]
+        ax.plot(wx, wy, "+", color=wp_color, ms=10, mew=1.5, zorder=9)
+
+        ax.set_title(
+            f"{wp_name}:  θ₁={t1:.1f}°  θ₂={t2:.1f}°\n"
+            f"EE=({ex:.2f}, {ey:.2f})",
+            color=wp_color, fontsize=8, pad=4)
+        ax.set_xlabel("x (in)", color="#666", fontsize=7)
+        ax.set_ylabel("y (in)", color="#666", fontsize=7)
+
+    plt.tight_layout()
+    plt.show(block=False);  plt.pause(0.1)
+    return fig
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Figure 2 — Live execution monitor
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LiveMonitor:
+    def __init__(self):
+        self.fig = plt.figure("Live execution", figsize=(13, 5))
+        self.fig.patch.set_facecolor("#1a1a1a")
+        gs = GridSpec(2, 2, figure=self.fig, wspace=0.12, hspace=0.38)
+
+        self.ax_ws = self.fig.add_subplot(gs[:, 0])
+        self.ax_t1 = self.fig.add_subplot(gs[0, 1])
+        self.ax_t2 = self.fig.add_subplot(gs[1, 1])
+
+        for ax in [self.ax_ws, self.ax_t1, self.ax_t2]:
+            ax.set_facecolor("#111")
+            for sp in ax.spines.values():
+                sp.set_color("#444")
+            ax.tick_params(colors="#888", labelsize=8)
+
+        ax = self.ax_ws
+        ax.set_xlim(-8, 8);  ax.set_ylim(-1, 9)
+        ax.set_aspect("equal");  ax.grid(color="#333", lw=0.4)
+        ax.axhline(0, color="#555", lw=0.6);  ax.axvline(0, color="#555", lw=0.6)
+        ax.set_xlabel("x (in)", color="#888", fontsize=9)
+        ax.set_ylabel("y (in)", color="#888", fontsize=9)
+        ax.set_title("Commanded (solid)  vs  Actual (dashed orange)",
+                     color="#ccc", fontsize=9)
+
+        for x1, x2, y1, y2 in OBSTACLES:
+            ax.add_patch(patches.Rectangle((x1, y1), x2-x1, y2-y1,
+                         fc="#e24b4a", alpha=0.45, ec="#e24b4a", lw=0.8))
+        for i, (wx, wy) in enumerate(WAYPOINTS):
+            ax.plot(wx, wy, "o", color=WP_COLORS[i], ms=7,
+                    markeredgecolor="white", markeredgewidth=0.8, zorder=6)
+            ax.text(wx+0.15, wy+0.15, WAYPOINT_NAMES[i],
+                    color=WP_COLORS[i], fontsize=9, fontweight="bold")
+
+        self.cmd_l1, = ax.plot([], [], color="#3266ad", lw=3,
+                               solid_capstyle="round")
+        self.cmd_l2, = ax.plot([], [], color="#1D9E75", lw=3,
+                               solid_capstyle="round")
+        self.act_l1, = ax.plot([], [], color="#f4a023", lw=2,
+                               ls="--", alpha=0.85)
+        self.act_l2, = ax.plot([], [], color="#f4a023", lw=2,
+                               ls="--", alpha=0.85)
+        self.cmd_ee, = ax.plot([], [], "o", color="white",   ms=6, zorder=8)
+        self.act_ee, = ax.plot([], [], "o", color="#f4a023", ms=6, zorder=8)
+        self.trace_x, self.trace_y = [], []
+        self.trace,  = ax.plot([], [], color="white", lw=0.8, alpha=0.35)
+
+        ax.legend(handles=[
+            Line2D([0],[0], color="#3266ad", lw=2, label="Commanded"),
+            Line2D([0],[0], color="#f4a023", lw=2, ls="--", label="Actual"),
+        ], loc="lower right", facecolor="#1a1a1a",
+           edgecolor="#444", labelcolor="#ccc", fontsize=8)
+
+        self.ax_t1.set_ylabel("θ₁ (deg)", color="#888", fontsize=8)
+        self.ax_t1.set_title("Joint angles — commanded vs actual",
+                             color="#ccc", fontsize=9)
+        self.ax_t1.grid(color="#333", lw=0.4)
+        self.t1c, = self.ax_t1.plot([], [], color="#3266ad", lw=1.2,
+                                    label="cmd θ₁")
+        self.t1a, = self.ax_t1.plot([], [], color="#f4a023", lw=1.2,
+                                    ls="--", label="act θ₁")
+        self.ax_t1.legend(loc="upper right", facecolor="#1a1a1a",
+                          edgecolor="#444", labelcolor="#ccc", fontsize=7)
+
+        self.ax_t2.set_xlabel("time (s)", color="#888", fontsize=8)
+        self.ax_t2.set_ylabel("θ₂ (deg)", color="#888", fontsize=8)
+        self.ax_t2.grid(color="#333", lw=0.4)
+        self.t2c, = self.ax_t2.plot([], [], color="#1D9E75", lw=1.2,
+                                    label="cmd θ₂")
+        self.t2a, = self.ax_t2.plot([], [], color="#f4a023", lw=1.2,
+                                    ls="--", label="act θ₂")
+        self.ax_t2.legend(loc="upper right", facecolor="#1a1a1a",
+                          edgecolor="#444", labelcolor="#ccc", fontsize=7)
+
+        self.times = []
+        self.t1cs  = [];  self.t1as = []
+        self.t2cs  = [];  self.t2as = []
+        self.t0    = time.time()
+
+        plt.tight_layout()
+        plt.show(block=False)
+        plt.pause(0.05)
+
+    def update(self, t1_cmd, t2_cmd, t1_act, t2_act):
+        now = time.time() - self.t0
+        self.times.append(now)
+        self.t1cs.append(t1_cmd);  self.t1as.append(t1_act)
+        self.t2cs.append(t2_cmd);  self.t2as.append(t2_act)
+
+        jx, jy, ex, ey = fk(t1_cmd, t2_cmd)
+        self.cmd_l1.set_data([0, jx], [0, jy])
+        self.cmd_l2.set_data([jx, ex], [jy, ey])
+        self.cmd_ee.set_data([ex], [ey])
+        self.trace_x.append(ex);  self.trace_y.append(ey)
+        self.trace.set_data(self.trace_x, self.trace_y)
+
+        ajx, ajy, aex, aey = fk(t1_act, t2_act)
+        self.act_l1.set_data([0, ajx], [0, ajy])
+        self.act_l2.set_data([ajx, aex], [ajy, aey])
+        self.act_ee.set_data([aex], [aey])
+
+        ts = self.times
+        self.t1c.set_data(ts, self.t1cs);  self.t1a.set_data(ts, self.t1as)
+        self.t2c.set_data(ts, self.t2cs);  self.t2a.set_data(ts, self.t2as)
+        for ax in [self.ax_t1, self.ax_t2]:
+            ax.relim();  ax.autoscale_view()
+
+        self.fig.canvas.flush_events()
+        plt.pause(0.001)
+
+    def mark_waypoint(self, name, color):
+        t = self.times[-1] if self.times else 0
+        for ax in [self.ax_t1, self.ax_t2]:
+            ax.axvline(t, color=color, lw=0.8, ls=":", alpha=0.7)
+            ax.text(t, ax.get_ylim()[0], name, color=color,
+                    fontsize=7, rotation=90, va="bottom")
+        self.fig.canvas.flush_events()
+        plt.pause(0.001)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Figure 3 — Post-run error summary
+# ══════════════════════════════════════════════════════════════════════════════
+
+def show_error_summary(records):
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4))
+    fig.patch.set_facecolor("#1a1a1a")
+    fig.suptitle(
+        "Post-run diagnostics\n"
+        "  Large joint error + small EE error  →  mechanical backlash / flex\n"
+        "  Small joint error + large EE error  →  IK / calibration offset\n"
+        "  Both large                           →  motor not reaching target",
+        color="#aaa", fontsize=9, x=0.01, ha="left"
+    )
+
+    names  = [r["name"]     for r in records]
+    colors = [r["color"]    for r in records]
+    ee_err = [r["ee_error"] for r in records]
+    t1_err = [abs(r["t1_act"] - r["t1_cmd"]) for r in records]
+    t2_err = [abs(r["t2_act"] - r["t2_cmd"]) for r in records]
+
+    for ax in axes:
+        ax.set_facecolor("#111")
+        for sp in ax.spines.values():
+            sp.set_color("#444")
+        ax.tick_params(colors="#888", labelsize=8)
+
+    bars = axes[0].bar(names, ee_err, color=colors, edgecolor="#444", width=0.5)
+    axes[0].axhline(0.5, color="#1D9E75", lw=1.2, ls="--", label='0.5" (full)')
+    axes[0].axhline(1.0, color="#EF9F27", lw=1.2, ls="--", label='1.0" (half)')
+    axes[0].set_ylabel("EE error (in)", color="#888", fontsize=9)
+    axes[0].set_title("End-effector error", color="#ccc", fontsize=10)
+    axes[0].legend(facecolor="#1a1a1a", edgecolor="#444",
+                   labelcolor="#ccc", fontsize=8)
+    for bar, v in zip(bars, ee_err):
+        axes[0].text(bar.get_x() + bar.get_width()/2, v + 0.01,
+                     f'{v:.3f}"', ha="center", color="#ccc", fontsize=8)
+
+    b1 = axes[1].bar(names, t1_err, color=colors, edgecolor="#444", width=0.5)
+    axes[1].axhline(POS_TOLERANCE, color="#f4a023", lw=1.2, ls="--",
+                    label=f"{POS_TOLERANCE}° tol")
+    axes[1].set_ylabel("θ₁ error (deg)", color="#888", fontsize=9)
+    axes[1].set_title("Joint 1 error", color="#ccc", fontsize=10)
+    axes[1].legend(facecolor="#1a1a1a", edgecolor="#444",
+                   labelcolor="#ccc", fontsize=8)
+    for bar, v in zip(b1, t1_err):
+        axes[1].text(bar.get_x() + bar.get_width()/2, v + 0.05,
+                     f"{v:.1f}°", ha="center", color="#ccc", fontsize=8)
+
+    b2 = axes[2].bar(names, t2_err, color=colors, edgecolor="#444", width=0.5)
+    axes[2].axhline(POS_TOLERANCE, color="#f4a023", lw=1.2, ls="--",
+                    label=f"{POS_TOLERANCE}° tol")
+    axes[2].set_ylabel("θ₂ error (deg)", color="#888", fontsize=9)
+    axes[2].set_title("Joint 2 error", color="#ccc", fontsize=10)
+    axes[2].legend(facecolor="#1a1a1a", edgecolor="#444",
+                   labelcolor="#ccc", fontsize=8)
+    for bar, v in zip(b2, t2_err):
+        axes[2].text(bar.get_x() + bar.get_width()/2, v + 0.05,
+                     f"{v:.1f}°", ha="center", color="#ccc", fontsize=8)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.76])
+    plt.show(block=False)
+    plt.pause(0.1)
+    return fig
